@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AlphaPulse Terminal</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+  html, body, #root { height: 100%; margin: 0; background:#0A0D12; }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-thumb { background: #1F2530; border-radius: 3px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// --- tiny inline icon components (no external icon package needed) ---
+function Icon({ children, size = 14, className = "" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      {children}
+    </svg>
+  );
+}
+const PauseIcon = (p) => <Icon {...p}><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></Icon>;
+const PlayIcon = (p) => <Icon {...p}><polygon points="5 3 19 12 5 21 5 3"/></Icon>;
+const ZapIcon = (p) => <Icon {...p}><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></Icon>;
+const ShieldIcon = (p) => <Icon {...p}><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></Icon>;
+const ShieldAlertIcon = (p) => <Icon {...p}><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></Icon>;
+const TrendUpIcon = (p) => <Icon {...p}><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></Icon>;
+const TrendDownIcon = (p) => <Icon {...p}><polyline points="23 18 13.5 8.5 8.5 13.5 1 6"/><polyline points="17 18 23 18 23 12"/></Icon>;
+const RadioIcon = (p) => <Icon {...p}><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-8.49a6 6 0 0 0 0 8.49m11.31-11.31a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"/></Icon>;
+const WalletIcon = (p) => <Icon {...p}><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></Icon>;
+
+// ---------------------------------------------------------------------
+// AlphaPulse Terminal — paper-trading simulator / dashboard.
+// Entirely client-side: generates plausible synthetic call/price data so the
+// full pipeline (feed -> score -> safety -> position -> PnL) is visible and
+// interactive without a live backend or real market connection.
+// ---------------------------------------------------------------------
+
+const TICKERS = ["PULSE", "NOVA", "GRIZZ", "FERAL", "ORBIT", "ASHEN", "VOLT", "RUNE", "GLINT", "HAZE", "KAIJU", "DRIFT"];
+const CALLERS = ["xbtscout", "onchain_owl", "degenwatch", "rugradar", "alpha_lynx"];
+const CHAINS = ["solana", "evm"];
+
+function rand(min, max) { return Math.random() * (max - min) + min; }
+function randInt(min, max) { return Math.floor(rand(min, max + 1)); }
+function choice(arr) { return arr[randInt(0, arr.length - 1)]; }
+function fakeAddress(chain) {
+  if (chain === "evm") {
+    return "0x" + Array.from({ length: 40 }, () => "0123456789abcdef"[randInt(0, 15)]).join("");
+  }
+  const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  return Array.from({ length: 38 }, () => alphabet[randInt(0, alphabet.length - 1)]).join("");
+}
+function short(addr) { return addr.slice(0, 4) + "…" + addr.slice(-4); }
+function fmtUsd(n, d = 2) { return "$" + n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d }); }
+function fmtPrice(n) {
+  if (n < 0.0001) return "$" + n.toExponential(2);
+  return "$" + n.toFixed(6);
+}
+
+function generateCandidate() {
+  const chain = choice(CHAINS);
+  const address = fakeAddress(chain);
+  const ticker = choice(TICKERS) + randInt(0, 99);
+  const caller = choice(CALLERS);
+
+  const safetyRoll = Math.random();
+  const isSafe = safetyRoll > 0.35;
+  const failureReasons = [];
+  if (!isSafe) {
+    const pool = ["mint_authority_not_revoked", "liquidity_not_locked_or_burned", "honeypot_simulation_failed", "holder_concentration_too_high"];
+    const n = randInt(1, 2);
+    for (let i = 0; i < n; i++) {
+      const r = choice(pool);
+      if (!failureReasons.includes(r)) failureReasons.push(r);
+    }
+  }
+
+  const socialVelocity = rand(20, 100);
+  const liquidityDepth = isSafe ? rand(40, 100) : rand(0, 60);
+  const holderConcentration = isSafe ? rand(50, 100) : rand(0, 50);
+  const reputationWeight = rand(50, 90);
+  const score = socialVelocity * 0.3 + liquidityDepth * 0.3 + holderConcentration * 0.25 + reputationWeight * 0.15;
+
+  const liquidityUsd = isSafe ? rand(8000, 120000) : rand(500, 6000);
+  const marketCapUsd = liquidityUsd * rand(8, 40);
+  const topHolderPct = 100 - holderConcentration * 0.9;
+  const priceUsd = marketCapUsd / rand(1e8, 1e10);
+
+  return {
+    id: `${Date.now()}-${randInt(0, 99999)}`,
+    chain, address, ticker, caller,
+    createdAt: Date.now(),
+    safety: { isSafe, failureReasons, liquidityUsd, topHolderPct },
+    score: {
+      total: Math.round(score * 10) / 10,
+      breakdown: {
+        socialVelocity: Math.round(socialVelocity),
+        liquidityDepth: Math.round(liquidityDepth),
+        holderConcentration: Math.round(holderConcentration),
+        reputationWeight: Math.round(reputationWeight),
+      },
+      passed: score >= 75,
+    },
+    marketCapUsd, priceUsd,
+  };
+}
+
+function Gauge({ value, size = 96, label, accent = "#00E5A0" }) {
+  const stroke = 7;
+  const r = (size - stroke) / 2;
+  const c = 2 * Math.PI * r;
+  const pct = Math.max(0, Math.min(100, value));
+  const offset = c - (pct / 100) * c;
+  return (
+    <div className="flex flex-col items-center gap-1.5">
+      <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
+        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="#1F2530" strokeWidth={stroke} />
+        <circle
+          cx={size / 2} cy={size / 2} r={r} fill="none" stroke={accent} strokeWidth={stroke}
+          strokeDasharray={c} strokeDashoffset={offset} strokeLinecap="round"
+          style={{ transition: "stroke-dashoffset 700ms cubic-bezier(.4,0,.2,1)" }}
+        />
+        <text x={size / 2} y={size / 2} fill="#E8EBF0" fontSize={size * 0.24} fontFamily="'JetBrains Mono', monospace"
+          textAnchor="middle" dominantBaseline="central" transform={`rotate(90 ${size / 2} ${size / 2})`}>
+          {Math.round(value)}
+        </text>
+      </svg>
+      <span className="text-[10px] tracking-wide uppercase text-[#6B7684] font-mono">{label}</span>
+    </div>
+  );
+}
+
+function PulseStrip({ pulses }) {
+  const width = 1000, height = 56, mid = height / 2;
+  const points = [];
+  const now = Date.now();
+  const windowMs = 12000;
+  for (let x = 0; x <= width; x += 4) {
+    const t = now - (1 - x / width) * windowMs;
+    let y = mid;
+    for (const p of pulses) {
+      const dt = t - p.at;
+      if (dt > -50 && dt < 900) {
+        const amp = p.magnitude * Math.exp(-Math.abs(dt - 150) / 180) * Math.cos(dt / 40);
+        y -= amp;
+      }
+    }
+    points.push(`${x},${y.toFixed(1)}`);
+  }
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" className="w-full h-14 block">
+      <line x1="0" y1={mid} x2={width} y2={mid} stroke="#1F2530" strokeWidth="1" />
+      <polyline points={points.join(" ")} fill="none" stroke="#00E5A0" strokeWidth="1.5"
+        style={{ filter: "drop-shadow(0 0 4px rgba(0,229,160,0.55))" }} />
+    </svg>
+  );
+}
+
+function Stat({ label, value }) {
+  return (
+    <div className="p-3 rounded-md border border-[#1F2530] bg-[#0D1117]">
+      <div className="text-[10px] uppercase tracking-wide text-[#6B7684] mono mb-1">{label}</div>
+      <div className="text-[14px] mono font-semibold">{value}</div>
+    </div>
+  );
+}
+
+function AlphaPulseDashboard() {
+  const [paused, setPaused] = useState(false);
+  const [feed, setFeed] = useState([]);
+  const [selectedId, setSelectedId] = useState(null);
+  const [positions, setPositions] = useState([]);
+  const [pulses, setPulses] = useState([]);
+  const [log, setLog] = useState([]);
+  const posSeq = useRef(0);
+
+  const pushLog = useCallback((text, tone = "dim") => {
+    setLog((l) => [{ id: Math.random(), text, tone, at: Date.now() }, ...l].slice(0, 40));
+  }, []);
+
+  useEffect(() => {
+    if (paused) return;
+    const interval = setInterval(() => {
+      const c = generateCandidate();
+      setFeed((f) => [c, ...f].slice(0, 30));
+      setSelectedId((sel) => sel ?? c.id);
+      setPulses((p) => [...p.filter((x) => Date.now() - x.at < 15000), { at: Date.now(), magnitude: 6 + c.score.total / 6 }]);
+
+      if (!c.safety.isSafe) {
+        pushLog(`${c.ticker} dropped — ${c.safety.failureReasons[0]}`, "red");
+      } else if (!c.score.passed) {
+        pushLog(`${c.ticker} scored ${c.score.total.toFixed(1)} — below threshold`, "dim");
+      } else {
+        pushLog(`${c.ticker} vetted at ${c.score.total.toFixed(1)} — paper entry filed`, "teal");
+        posSeq.current += 1;
+        const qty = 100 / c.priceUsd;
+        setPositions((ps) => [
+          {
+            id: `pos-${posSeq.current}`,
+            ticker: c.ticker, chain: c.chain, address: c.address,
+            entryPrice: c.priceUsd, currentPrice: c.priceUsd,
+            qty, remainingQty: qty, entryUsd: 100,
+            openedAt: Date.now(), status: "open", realizedPnl: 0,
+            tp: [{ mult: 2, pct: 50, done: false }, { mult: 4, pct: 25, done: false }, { mult: 8, pct: 25, done: false }],
+            sl: 25,
+          },
+          ...ps,
+        ]);
+      }
+    }, 4200);
+    return () => clearInterval(interval);
+  }, [paused, pushLog]);
+
+  useEffect(() => {
+    if (paused) return;
+    const interval = setInterval(() => {
+      setPositions((ps) =>
+        ps.map((p) => {
+          if (p.status !== "open") return p;
+          const drift = 1 + rand(-0.09, 0.14);
+          const newPrice = Math.max(p.currentPrice * drift, p.entryPrice * 0.01);
+          const pnlPct = ((newPrice - p.entryPrice) / p.entryPrice) * 100;
+          const mult = newPrice / p.entryPrice;
+
+          if (pnlPct <= -p.sl) {
+            pushLog(`${p.ticker} stop-loss hit at ${pnlPct.toFixed(1)}% — full exit`, "red");
+            return { ...p, currentPrice: newPrice, status: "closed", remainingQty: 0, realizedPnl: p.realizedPnl + p.remainingQty * (newPrice - p.entryPrice) };
+          }
+
+          let remainingQty = p.remainingQty;
+          let realizedPnl = p.realizedPnl;
+          const tp = p.tp.map((step) => {
+            if (!step.done && mult >= step.mult) {
+              const qtySold = remainingQty * (step.pct / 100);
+              realizedPnl += qtySold * (newPrice - p.entryPrice);
+              remainingQty -= qtySold;
+              pushLog(`${p.ticker} take-profit ${step.mult}x — sold ${step.pct}%`, "amber");
+              return { ...step, done: true };
+            }
+            return step;
+          });
+
+          const status = remainingQty <= p.qty * 0.001 ? "closed" : "open";
+          return { ...p, currentPrice: newPrice, tp, remainingQty, realizedPnl, status };
+        })
+      );
+    }, 2200);
+    return () => clearInterval(interval);
+  }, [paused, pushLog]);
+
+  const selected = feed.find((f) => f.id === selectedId);
+  const openPositions = positions.filter((p) => p.status === "open");
+  const totalRealized = positions.reduce((sum, p) => sum + p.realizedPnl, 0);
+  const totalUnrealized = openPositions.reduce((sum, p) => sum + p.remainingQty * (p.currentPrice - p.entryPrice), 0);
+
+  return (
+    <div className="min-h-screen w-full bg-[#0A0D12] text-[#E8EBF0] flex flex-col" style={{ fontFamily: "Inter, system-ui, sans-serif" }}>
+      <header className="border-b border-[#1F2530] px-5 py-3 flex items-center justify-between shrink-0">
+        <div className="flex items-center gap-3">
+          <div className="w-7 h-7 rounded-full bg-[#00E5A0]/10 border border-[#00E5A0]/40 flex items-center justify-center">
+            <RadioIcon size={14} className="text-[#00E5A0]" />
+          </div>
+          <div>
+            <div className="font-semibold tracking-tight text-[15px] leading-none">AlphaPulse</div>
+            <div className="text-[10px] text-[#6B7684] mono mt-0.5">social + on-chain signal terminal</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-[#FFB020]/40 bg-[#FFB020]/10">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#FFB020]"></span>
+            <span className="text-[11px] mono text-[#FFB020]">PAPER MODE</span>
+          </div>
+          <button
+            onClick={() => setPaused((p) => !p)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-[#1F2530] bg-[#12161D] hover:bg-[#171C25] transition-colors text-[12px] font-medium"
+          >
+            {paused ? <PlayIcon size={13} /> : <PauseIcon size={13} />}
+            {paused ? "Resume" : "Pause"}
+          </button>
+        </div>
+      </header>
+
+      <div className="border-b border-[#1F2530] px-5 py-2 shrink-0">
+        <PulseStrip pulses={pulses} />
+      </div>
+
+      <div className="flex-1 grid grid-cols-1 lg:grid-cols-[320px_1fr_360px] min-h-0">
+        <div className="border-r border-[#1F2530] flex flex-col min-h-0">
+          <div className="px-4 py-2.5 border-b border-[#1F2530] flex items-center justify-between shrink-0">
+            <span className="text-[11px] uppercase tracking-wider text-[#6B7684] font-semibold">Live Call Feed</span>
+            <span className="text-[10px] mono text-[#6B7684]">{feed.length}</span>
+          </div>
+          <div className="flex-1 overflow-y-auto" style={{ maxHeight: "40vh" }}>
+            {feed.length === 0 && <div className="p-4 text-[12px] text-[#6B7684]">Listening for calls…</div>}
+            {feed.map((c) => (
+              <button
+                key={c.id}
+                onClick={() => setSelectedId(c.id)}
+                className={`w-full text-left px-4 py-3 border-b border-[#1F2530]/60 transition-colors ${selectedId === c.id ? "bg-[#12161D]" : "hover:bg-[#0E1218]"}`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-[13px]">{c.ticker}</span>
+                  <span className="mono text-[11px] text-[#6B7684]">{c.chain}</span>
+                </div>
+                <div className="text-[10px] text-[#6B7684] mono mt-0.5">@{c.caller} · {short(c.address)}</div>
+                <div className="flex items-center gap-2 mt-1.5">
+                  {c.safety.isSafe ? <ShieldIcon size={11} className="text-[#00E5A0]" /> : <ShieldAlertIcon size={11} className="text-[#FF4D5E]" />}
+                  <span className={`text-[11px] mono ${c.score.passed ? "text-[#00E5A0]" : "text-[#6B7684]"}`}>{c.score.total.toFixed(1)}</span>
+                  {c.score.passed && c.safety.isSafe && (
+                    <span className="text-[9px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-[#00E5A0]/10 text-[#00E5A0] ml-auto">entered</span>
+                  )}
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex flex-col min-h-0 overflow-y-auto">
+          {selected ? (
+            <div className="p-6">
+              <div className="flex items-start justify-between mb-6 flex-wrap gap-3">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h1 className="text-2xl font-bold tracking-tight">{selected.ticker}</h1>
+                    <span className="text-[11px] mono text-[#6B7684] px-2 py-0.5 rounded border border-[#1F2530]">{selected.chain}</span>
+                  </div>
+                  <div className="mono text-[12px] text-[#6B7684] mt-1 break-all">{selected.address}</div>
+                  <div className="text-[12px] text-[#6B7684] mt-1">called by <span className="text-[#E8EBF0]">@{selected.caller}</span></div>
+                </div>
+                <div className={`px-3 py-1.5 rounded-md text-[11px] font-semibold uppercase tracking-wide ${selected.safety.isSafe ? "bg-[#00E5A0]/10 text-[#00E5A0] border border-[#00E5A0]/30" : "bg-[#FF4D5E]/10 text-[#FF4D5E] border border-[#FF4D5E]/30"}`}>
+                  {selected.safety.isSafe ? "Safety Passed" : "Safety Failed"}
+                </div>
+              </div>
+
+              {!selected.safety.isSafe && (
+                <div className="mb-6 p-3 rounded-md border border-[#FF4D5E]/30 bg-[#FF4D5E]/5">
+                  <div className="text-[11px] uppercase tracking-wide text-[#FF4D5E] mb-1 font-semibold">Failure reasons</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {selected.safety.failureReasons.map((r) => (
+                      <span key={r} className="text-[11px] mono px-2 py-0.5 rounded bg-[#12161D] text-[#FF9AA5]">{r}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="mb-6">
+                <div className="text-[11px] uppercase tracking-wider text-[#6B7684] font-semibold mb-3">Parabolic Score</div>
+                <div className="flex items-center gap-6 flex-wrap p-5 rounded-lg border border-[#1F2530] bg-[#0D1117]">
+                  <Gauge value={selected.score.total} size={104} label="Total" accent={selected.score.passed ? "#00E5A0" : "#6B7684"} />
+                  <div className="h-16 w-px bg-[#1F2530] hidden sm:block"></div>
+                  <Gauge value={selected.score.breakdown.socialVelocity} label="Velocity" accent="#4EA8FF" />
+                  <Gauge value={selected.score.breakdown.liquidityDepth} label="Liquidity" accent="#4EA8FF" />
+                  <Gauge value={selected.score.breakdown.holderConcentration} label="Distribution" accent="#4EA8FF" />
+                  <Gauge value={selected.score.breakdown.reputationWeight} label="Reputation" accent="#4EA8FF" />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+                <Stat label="Liquidity" value={fmtUsd(selected.safety.liquidityUsd, 0)} />
+                <Stat label="Market Cap" value={fmtUsd(selected.marketCapUsd, 0)} />
+                <Stat label="Price" value={fmtPrice(selected.priceUsd)} />
+                <Stat label="Top Holder" value={selected.safety.topHolderPct.toFixed(1) + "%"} />
+              </div>
+
+              {selected.score.passed && selected.safety.isSafe ? (
+                <div className="flex items-center gap-2 text-[12px] text-[#00E5A0] mono">
+                  <ZapIcon size={13} /> Vetted — paper entry filed automatically at $100 notional
+                </div>
+              ) : (
+                <div className="text-[12px] text-[#6B7684] mono">Did not clear the entry pipeline — no position opened.</div>
+              )}
+            </div>
+          ) : (
+            <div className="flex-1 flex items-center justify-center text-[#6B7684] text-[13px] p-10">Select a call from the feed</div>
+          )}
+        </div>
+
+        <div className="border-l border-[#1F2530] flex flex-col min-h-0">
+          <div className="px-4 py-2.5 border-b border-[#1F2530] shrink-0">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[11px] uppercase tracking-wider text-[#6B7684] font-semibold flex items-center gap-1.5">
+                <WalletIcon size={12} /> Positions
+              </span>
+              <span className="text-[10px] mono text-[#6B7684]">{openPositions.length} open</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="p-2 rounded bg-[#0D1117] border border-[#1F2530]">
+                <div className="text-[9px] uppercase text-[#6B7684] mono">Realized</div>
+                <div className={`text-[13px] mono font-semibold ${totalRealized >= 0 ? "text-[#00E5A0]" : "text-[#FF4D5E]"}`}>
+                  {totalRealized >= 0 ? "+" : ""}{fmtUsd(totalRealized)}
+                </div>
+              </div>
+              <div className="p-2 rounded bg-[#0D1117] border border-[#1F2530]">
+                <div className="text-[9px] uppercase text-[#6B7684] mono">Unrealized</div>
+                <div className={`text-[13px] mono font-semibold ${totalUnrealized >= 0 ? "text-[#00E5A0]" : "text-[#FF4D5E]"}`}>
+                  {totalUnrealized >= 0 ? "+" : ""}{fmtUsd(totalUnrealized)}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="overflow-y-auto shrink-0" style={{ maxHeight: "30vh" }}>
+            {positions.length === 0 && <div className="p-4 text-[12px] text-[#6B7684]">No positions yet.</div>}
+            {positions.map((p) => {
+              const pnlPct = ((p.currentPrice - p.entryPrice) / p.entryPrice) * 100;
+              return (
+                <div key={p.id} className="px-4 py-2.5 border-b border-[#1F2530]/60">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-[12px]">{p.ticker}</span>
+                    <span className={`text-[11px] mono flex items-center gap-1 ${pnlPct >= 0 ? "text-[#00E5A0]" : "text-[#FF4D5E]"}`}>
+                      {pnlPct >= 0 ? <TrendUpIcon size={11} /> : <TrendDownIcon size={11} />}
+                      {pnlPct >= 0 ? "+" : ""}{pnlPct.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between mt-0.5">
+                    <span className="text-[10px] text-[#6B7684] mono">{fmtPrice(p.entryPrice)} → {fmtPrice(p.currentPrice)}</span>
+                    <span className={`text-[9px] uppercase mono px-1.5 rounded ${p.status === "open" ? "text-[#FFB020]" : "text-[#6B7684]"}`}>{p.status}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="px-4 py-2 border-t border-y border-[#1F2530] shrink-0">
+            <span className="text-[11px] uppercase tracking-wider text-[#6B7684] font-semibold">Activity</span>
+          </div>
+          <div className="flex-1 overflow-y-auto px-4 py-2 space-y-1.5">
+            {log.map((l) => (
+              <div key={l.id} className="text-[11px] mono leading-snug">
+                <span className="text-[#3A4250]">{new Date(l.at).toLocaleTimeString()} </span>
+                <span className={l.tone === "teal" ? "text-[#00E5A0]" : l.tone === "red" ? "text-[#FF4D5E]" : l.tone === "amber" ? "text-[#FFB020]" : "text-[#8B95A5]"}>
+                  {l.text}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<AlphaPulseDashboard />);
+</script>
+</body>
+</html>
